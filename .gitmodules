@@ -1,0 +1,6 @@
+[submodule "lib/nthaka"]
+	path = lib/nthaka
+	url = https://github.com/U-1F992/nthaka.git
+[submodule "lib/Bluewhale"]
+	path = lib/Bluewhale
+	url = https://github.com/mizuyoukanao/Bluewhale.git
