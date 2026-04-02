@@ -25,9 +25,6 @@ namespace jiangtun
         nthaka_button_state_t gc_reset;
 
         ResetAction next_action;
-
-        uint16_t hue;
-        uint32_t color;
     };
 
 }

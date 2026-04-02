@@ -1,8 +1,6 @@
 #include <Arduino.h>
 #include <Servo.h>
 
-#include <Adafruit_NeoPixel.h>
-
 #include "pico/mutex.h"
 #include "hardware/timer.h"
 
@@ -16,40 +14,7 @@
 
 #include "jiangtun.h"
 
-#ifdef JIANGTUN_CONFIG_BOARD_XIAO_RP2040
-
-#define PIN_RESET D10
-#define PIN_SERVO D6
-#define PIN_GAMECUBE D5
-
-static Adafruit_NeoPixel pixels(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
-#define initLED()                           \
-    do                                      \
-    {                                       \
-        pinMode(PIN_LED_R, OUTPUT);         \
-        pinMode(PIN_LED_G, OUTPUT);         \
-        pinMode(PIN_LED_B, OUTPUT);         \
-        digitalWrite(PIN_LED_R, HIGH);      \
-        digitalWrite(PIN_LED_G, HIGH);      \
-        digitalWrite(PIN_LED_B, HIGH);      \
-        pixels.begin();                     \
-        pinMode(NEOPIXEL_POWER, OUTPUT);    \
-        digitalWrite(NEOPIXEL_POWER, HIGH); \
-    } while (0)
-#define turnOnLED(color)                  \
-    do                                    \
-    {                                     \
-        pixels.setPixelColor(0, (color)); \
-        pixels.show();                    \
-    } while (0)
-#define turnOffLED()    \
-    do                  \
-    {                   \
-        pixels.clear(); \
-        pixels.show();  \
-    } while (0)
-
-#elif defined(JIANGTUN_CONFIG_BOARD_XIAO_RP2350)
+#ifdef JIANGTUN_CONFIG_BOARD_XIAO_RP2350
 
 #define PIN_RESET D10
 #define PIN_SERVO D6
@@ -84,9 +49,7 @@ static Adafruit_NeoPixel pixels(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 static mutex_t mtx;
 jiangtun::State state{.gc_data = defaultGamecubeData,
                       .gc_reset = NTHAKA_BUTTON_RELEASED,
-                      .next_action = jiangtun::ResetAction::Nothing,
-                      .hue = 0,
-                      .color = Adafruit_NeoPixel::ColorHSV(0)};
+                      .next_action = jiangtun::ResetAction::Nothing};
 
 /*************************************************************************
  **                                                                     **
@@ -132,7 +95,7 @@ static int64_t _turnOffLED(alarm_id_t _0, void *_1)
 
 static inline void blinkLEDAsync()
 {
-    turnOnLED(state.color);
+    turnOnLED(0);
     add_alarm_in_ms(100, _turnOffLED, nullptr, false);
 }
 
@@ -396,11 +359,6 @@ void loop1()
     // Copy state briefly under mutex, then release so core0 can update freely
     mutex_enter_blocking(&mtx);
     {
-        // This would be a useless calculation for JIANGTUN_CONFIG_BOARD_PICO,
-        // but it is intentionally left out to avoid making a difference in processing time.
-        state.color = Adafruit_NeoPixel::ColorHSV(state.hue);
-        state.hue += 16;
-
         gc_data_copy = state.gc_data;
         next_action = state.next_action;
         state.next_action = jiangtun::ResetAction::Nothing;
