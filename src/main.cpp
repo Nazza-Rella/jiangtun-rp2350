@@ -48,6 +48,7 @@
 
 static mutex_t mtx;
 jiangtun::State state{.gc_data = defaultGamecubeData,
+                      .gc_data_held = defaultGamecubeData,
                       .gc_reset = NTHAKA_BUTTON_RELEASED,
                       .next_action = jiangtun::ResetAction::Nothing};
 
@@ -214,6 +215,28 @@ static void updateState(nthaka_gamepad_state_t &gamepad, size_t idx)
     state.gc_data.report.cxAxis = gamepad.r_stick.x;
     uint8_t cy_axis = 0xFF - gamepad.r_stick.y;
     state.gc_data.report.cyAxis = cy_axis == 0U ? 1U : cy_axis;
+
+    // OR-accumulate digital button presses so short inputs are not lost
+    // between consecutive core1 reads.
+    state.gc_data_held.report.a |= state.gc_data.report.a;
+    state.gc_data_held.report.b |= state.gc_data.report.b;
+    state.gc_data_held.report.x |= state.gc_data.report.x;
+    state.gc_data_held.report.y |= state.gc_data.report.y;
+    state.gc_data_held.report.l |= state.gc_data.report.l;
+    state.gc_data_held.report.r |= state.gc_data.report.r;
+    state.gc_data_held.report.z |= state.gc_data.report.z;
+    state.gc_data_held.report.start |= state.gc_data.report.start;
+    state.gc_data_held.report.dup |= state.gc_data.report.dup;
+    state.gc_data_held.report.ddown |= state.gc_data.report.ddown;
+    state.gc_data_held.report.dleft |= state.gc_data.report.dleft;
+    state.gc_data_held.report.dright |= state.gc_data.report.dright;
+    // Analog values: always use latest
+    state.gc_data_held.report.xAxis = state.gc_data.report.xAxis;
+    state.gc_data_held.report.yAxis = state.gc_data.report.yAxis;
+    state.gc_data_held.report.cxAxis = state.gc_data.report.cxAxis;
+    state.gc_data_held.report.cyAxis = state.gc_data.report.cyAxis;
+    state.gc_data_held.report.left = state.gc_data.report.left;
+    state.gc_data_held.report.right = state.gc_data.report.right;
 }
 
 void setup()
@@ -356,19 +379,19 @@ void loop1()
     Gamecube_Data_t gc_data_copy;
     jiangtun::ResetAction next_action;
 
-    // Copy state briefly under mutex, then release so core0 can update freely
     mutex_enter_blocking(&mtx);
     {
-        gc_data_copy = state.gc_data;
+        // Read the OR-accumulated state (captures any short presses since last read)
+        gc_data_copy = state.gc_data_held;
         next_action = state.next_action;
         state.next_action = jiangtun::ResetAction::Nothing;
+        // Reset held state to current state for next accumulation cycle
+        state.gc_data_held = state.gc_data;
     }
     mutex_exit(&mtx);
 
-    // GC communication blocks ~6ms waiting for console poll — no mutex held
     gamecube.write(gc_data_copy);
 
-    // Write back rumble state from GC response
     mutex_enter_blocking(&mtx);
     {
         state.gc_data.status.rumble = gc_data_copy.status.rumble;
