@@ -1,12 +1,7 @@
 #ifndef JIANGTUN_H_
 #define JIANGTUN_H_
 
-#include <Servo.h>
-
-#include <array>
-
 #include "Bluewhale.h"
-#include "nthaka.h"
 
 namespace jiangtun
 {
@@ -19,13 +14,13 @@ namespace jiangtun
         Nothing
     };
 
-    struct State
+    // One deserialized serial command, queued from core0 to core1.
+    // Each queued command is guaranteed to be written to the GameCube
+    // at least once.
+    struct Command
     {
-        Gamecube_Data_t gc_data;
-        Gamecube_Data_t gc_data_held; // OR-accumulated button presses since last core1 read
-        nthaka_button_state_t gc_reset;
-
-        ResetAction next_action;
+        Gamecube_Report_t report;
+        ResetAction action;
     };
 
 }

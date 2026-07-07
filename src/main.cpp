@@ -20,37 +20,35 @@
 #define PIN_SERVO D6
 #define PIN_GAMECUBE D5
 
-#define initLED()                       \
-    do                                  \
-    {                                   \
-        pinMode(LED_BUILTIN, OUTPUT);   \
-        digitalWrite(LED_BUILTIN, LOW); \
-    } while (0)
-#define turnOnLED(_) (digitalWrite(LED_BUILTIN, HIGH))
-#define turnOffLED() (digitalWrite(LED_BUILTIN, LOW))
-
 #else // JIANGTUN_CONFIG_BOARD_PICO
 
 #define PIN_RESET 3
 #define PIN_SERVO 6
 #define PIN_GAMECUBE 5
 
+#endif
+
 #define initLED()                       \
     do                                  \
     {                                   \
         pinMode(LED_BUILTIN, OUTPUT);   \
         digitalWrite(LED_BUILTIN, LOW); \
     } while (0)
-#define turnOnLED(_) (digitalWrite(LED_BUILTIN, HIGH))
+#define turnOnLED() (digitalWrite(LED_BUILTIN, HIGH))
 #define turnOffLED() (digitalWrite(LED_BUILTIN, LOW))
 
-#endif
-
+/*
+ * core0 deserializes serial commands and pushes them into a ring queue.
+ * core1 pops one command per GameCube poll and answers the poll.
+ * Every queued command is written to the GameCube at least once, so
+ * short presses can no longer vanish while core1 is blocked inside
+ * gamecube.write() waiting for the console to poll.
+ */
 static mutex_t mtx;
-jiangtun::State state{.gc_data = defaultGamecubeData,
-                      .gc_data_held = defaultGamecubeData,
-                      .gc_reset = NTHAKA_BUTTON_RELEASED,
-                      .next_action = jiangtun::ResetAction::Nothing};
+static constexpr size_t kQueueSize = 64;
+static jiangtun::Command queue_[kQueueSize];
+static size_t queueHead = 0;  // next entry core1 will send
+static size_t queueCount = 0; // number of queued entries
 
 /*************************************************************************
  **                                                                     **
@@ -88,6 +86,12 @@ static size_t auto_reset_release_idx_size = sizeof(auto_reset_release_idx) / siz
 static nthaka_multi_format_handler_t fmt;
 static nthaka_buffer_t buf;
 
+// core0-only parser state
+static Gamecube_Report_t report_work;
+static nthaka_button_state_t prev_home = NTHAKA_BUTTON_RELEASED;
+static uint32_t last_byte_millis = 0;
+static bool buf_pending = false;
+
 static int64_t _turnOffLED(alarm_id_t _0, void *_1)
 {
     turnOffLED();
@@ -96,154 +100,175 @@ static int64_t _turnOffLED(alarm_id_t _0, void *_1)
 
 static inline void blinkLEDAsync()
 {
-    turnOnLED(0);
+    turnOnLED();
     add_alarm_in_ms(100, _turnOffLED, nullptr, false);
 }
 
-static void updateState(nthaka_gamepad_state_t &gamepad, size_t idx)
+static jiangtun::Command makeCommand(nthaka_gamepad_state_t &gamepad, size_t idx)
 {
-    // Update the reset state and determine the next reset action.
-    nthaka_button_state_t next_reset_state = gamepad.home;
-    if (state.gc_reset != next_reset_state)
+    jiangtun::Command cmd;
+
+    // Determine the reset action from the home button edge.
+    cmd.action = jiangtun::ResetAction::Nothing;
+    nthaka_button_state_t next_home = gamepad.home;
+    if (prev_home != next_home)
     {
-        if (next_reset_state == NTHAKA_BUTTON_PRESSED)
+        if (next_home == NTHAKA_BUTTON_PRESSED)
         {
-            state.next_action = jiangtun::ResetAction::Press;
+            cmd.action = jiangtun::ResetAction::Press;
 
             for (size_t i = 0; i < auto_reset_release_idx_size; i++)
             {
                 if (auto_reset_release_idx[i] == idx)
                 {
-                    state.next_action = jiangtun::ResetAction::PressRelease;
+                    cmd.action = jiangtun::ResetAction::PressRelease;
+                    // These formats never send an explicit release, so
+                    // rearm the edge detector for the next press.
+                    next_home = NTHAKA_BUTTON_RELEASED;
                     break;
                 }
             }
         }
         else
         {
-            state.next_action = jiangtun::ResetAction::Release;
+            cmd.action = jiangtun::ResetAction::Release;
         }
-        state.gc_reset = next_reset_state;
-    }
-    else
-    {
-        state.next_action = jiangtun::ResetAction::Nothing;
+        prev_home = next_home;
     }
 
-    // Convert nthaka_gamepad_state_t to Gamecube_Data_t
-    state.gc_data.report.y = gamepad.y == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
-    state.gc_data.report.b = gamepad.b == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
-    state.gc_data.report.a = gamepad.a == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
-    state.gc_data.report.x = gamepad.x == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
-    state.gc_data.report.l = gamepad.l == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
-    state.gc_data.report.r = gamepad.r == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
-    state.gc_data.report.z = gamepad.zr == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
-    state.gc_data.report.start = gamepad.plus == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
+    // Convert nthaka_gamepad_state_t to Gamecube_Report_t
+    report_work.y = gamepad.y == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
+    report_work.b = gamepad.b == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
+    report_work.a = gamepad.a == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
+    report_work.x = gamepad.x == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
+    report_work.l = gamepad.l == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
+    report_work.r = gamepad.r == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
+    report_work.z = gamepad.zr == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
+    report_work.start = gamepad.plus == NTHAKA_BUTTON_PRESSED ? 1U : 0U;
 
     switch (gamepad.hat)
     {
     case NTHAKA_HAT_UP:
-        state.gc_data.report.dup = 1U;
-        state.gc_data.report.dright = 0U;
-        state.gc_data.report.ddown = 0U;
-        state.gc_data.report.dleft = 0U;
+        report_work.dup = 1U;
+        report_work.dright = 0U;
+        report_work.ddown = 0U;
+        report_work.dleft = 0U;
         break;
 
     case NTHAKA_HAT_UPRIGHT:
-        state.gc_data.report.dup = 1U;
-        state.gc_data.report.dright = 1U;
-        state.gc_data.report.ddown = 0U;
-        state.gc_data.report.dleft = 0U;
+        report_work.dup = 1U;
+        report_work.dright = 1U;
+        report_work.ddown = 0U;
+        report_work.dleft = 0U;
         break;
 
     case NTHAKA_HAT_RIGHT:
-        state.gc_data.report.dup = 0U;
-        state.gc_data.report.dright = 1U;
-        state.gc_data.report.ddown = 0U;
-        state.gc_data.report.dleft = 0U;
+        report_work.dup = 0U;
+        report_work.dright = 1U;
+        report_work.ddown = 0U;
+        report_work.dleft = 0U;
         break;
 
     case NTHAKA_HAT_DOWNRIGHT:
-        state.gc_data.report.dup = 0U;
-        state.gc_data.report.dright = 1U;
-        state.gc_data.report.ddown = 1U;
-        state.gc_data.report.dleft = 0U;
+        report_work.dup = 0U;
+        report_work.dright = 1U;
+        report_work.ddown = 1U;
+        report_work.dleft = 0U;
         break;
 
     case NTHAKA_HAT_DOWN:
-        state.gc_data.report.dup = 0U;
-        state.gc_data.report.dright = 0U;
-        state.gc_data.report.ddown = 1U;
-        state.gc_data.report.dleft = 0U;
+        report_work.dup = 0U;
+        report_work.dright = 0U;
+        report_work.ddown = 1U;
+        report_work.dleft = 0U;
         break;
 
     case NTHAKA_HAT_DOWNLEFT:
-        state.gc_data.report.dup = 0U;
-        state.gc_data.report.dright = 0U;
-        state.gc_data.report.ddown = 1U;
-        state.gc_data.report.dleft = 1U;
+        report_work.dup = 0U;
+        report_work.dright = 0U;
+        report_work.ddown = 1U;
+        report_work.dleft = 1U;
         break;
 
     case NTHAKA_HAT_LEFT:
-        state.gc_data.report.dup = 0U;
-        state.gc_data.report.dright = 0U;
-        state.gc_data.report.ddown = 0U;
-        state.gc_data.report.dleft = 1U;
+        report_work.dup = 0U;
+        report_work.dright = 0U;
+        report_work.ddown = 0U;
+        report_work.dleft = 1U;
         break;
 
     case NTHAKA_HAT_UPLEFT:
-        state.gc_data.report.dup = 1U;
-        state.gc_data.report.dright = 0U;
-        state.gc_data.report.ddown = 0U;
-        state.gc_data.report.dleft = 1U;
+        report_work.dup = 1U;
+        report_work.dright = 0U;
+        report_work.ddown = 0U;
+        report_work.dleft = 1U;
         break;
 
     case NTHAKA_HAT_NEUTRAL:
     default:
-        state.gc_data.report.dup = 0U;
-        state.gc_data.report.dright = 0U;
-        state.gc_data.report.ddown = 0U;
-        state.gc_data.report.dleft = 0U;
+        report_work.dup = 0U;
+        report_work.dright = 0U;
+        report_work.ddown = 0U;
+        report_work.dleft = 0U;
         break;
     }
 
     // There are a few games that do not handle yAxis=0 and cyAxis=0 correctly.
-    state.gc_data.report.xAxis = gamepad.l_stick.x;
+    report_work.xAxis = gamepad.l_stick.x;
     uint8_t y_axis = 0xFF - gamepad.l_stick.y;
-    state.gc_data.report.yAxis = y_axis == 0U ? 1U : y_axis;
+    report_work.yAxis = y_axis == 0U ? 1U : y_axis;
 
-    state.gc_data.report.cxAxis = gamepad.r_stick.x;
+    report_work.cxAxis = gamepad.r_stick.x;
     uint8_t cy_axis = 0xFF - gamepad.r_stick.y;
-    state.gc_data.report.cyAxis = cy_axis == 0U ? 1U : cy_axis;
+    report_work.cyAxis = cy_axis == 0U ? 1U : cy_axis;
 
-    // OR-accumulate digital button presses so short inputs are not lost
-    // between consecutive core1 reads.
-    state.gc_data_held.report.a |= state.gc_data.report.a;
-    state.gc_data_held.report.b |= state.gc_data.report.b;
-    state.gc_data_held.report.x |= state.gc_data.report.x;
-    state.gc_data_held.report.y |= state.gc_data.report.y;
-    state.gc_data_held.report.l |= state.gc_data.report.l;
-    state.gc_data_held.report.r |= state.gc_data.report.r;
-    state.gc_data_held.report.z |= state.gc_data.report.z;
-    state.gc_data_held.report.start |= state.gc_data.report.start;
-    state.gc_data_held.report.dup |= state.gc_data.report.dup;
-    state.gc_data_held.report.ddown |= state.gc_data.report.ddown;
-    state.gc_data_held.report.dleft |= state.gc_data.report.dleft;
-    state.gc_data_held.report.dright |= state.gc_data.report.dright;
-    // Analog values: always use latest
-    state.gc_data_held.report.xAxis = state.gc_data.report.xAxis;
-    state.gc_data_held.report.yAxis = state.gc_data.report.yAxis;
-    state.gc_data_held.report.cxAxis = state.gc_data.report.cxAxis;
-    state.gc_data_held.report.cyAxis = state.gc_data.report.cyAxis;
-    state.gc_data_held.report.left = state.gc_data.report.left;
-    state.gc_data_held.report.right = state.gc_data.report.right;
+    cmd.report = report_work;
+    return cmd;
+}
+
+static void pushCommand(const jiangtun::Command &cmd)
+{
+    mutex_enter_blocking(&mtx);
+    if (queueCount < kQueueSize)
+    {
+        queue_[(queueHead + queueCount) % kQueueSize] = cmd;
+        queueCount++;
+    }
+    else
+    {
+        // Queue overflow: coalesce into the newest entry so that presses
+        // are kept (OR) and analog values reflect the latest command.
+        jiangtun::Command &last = queue_[(queueHead + queueCount - 1) % kQueueSize];
+        last.report.a |= cmd.report.a;
+        last.report.b |= cmd.report.b;
+        last.report.x |= cmd.report.x;
+        last.report.y |= cmd.report.y;
+        last.report.l |= cmd.report.l;
+        last.report.r |= cmd.report.r;
+        last.report.z |= cmd.report.z;
+        last.report.start |= cmd.report.start;
+        last.report.dup |= cmd.report.dup;
+        last.report.ddown |= cmd.report.ddown;
+        last.report.dleft |= cmd.report.dleft;
+        last.report.dright |= cmd.report.dright;
+        last.report.xAxis = cmd.report.xAxis;
+        last.report.yAxis = cmd.report.yAxis;
+        last.report.cxAxis = cmd.report.cxAxis;
+        last.report.cyAxis = cmd.report.cyAxis;
+        last.report.left = cmd.report.left;
+        last.report.right = cmd.report.right;
+        if (cmd.action != jiangtun::ResetAction::Nothing)
+        {
+            last.action = cmd.action;
+        }
+    }
+    mutex_exit(&mtx);
 }
 
 void setup()
 {
     mutex_init(&mtx);
 
-    Serial.setTimeout(100);
     Serial.begin(9600);
 
     initLED();
@@ -254,36 +279,53 @@ void setup()
     pokecon_format_handler_init(&pokecon);
     nthaka_multi_format_handler_init(&fmt, fmts, 3);
     nthaka_buffer_init(&buf, (nthaka_format_handler_t *)&fmt);
+
+    report_work = defaultGamecubeData.report;
 }
 
 void loop()
 {
     static nthaka_gamepad_state_t out;
 
-    uint8_t in;
-    nthaka_buffer_state_t s;
-    if (Serial.readBytes(&in, 1) != 1 ||
-        (s = nthaka_buffer_append(&buf, in, &out)) == NTHAKA_BUFFER_REJECTED)
+    // Discard a stalled partial packet so a desynced stream can recover.
+    if (buf_pending && (uint32_t)(millis() - last_byte_millis) > 100)
     {
         nthaka_buffer_clear(&buf);
-        return;
-    }
-    else if (s == NTHAKA_BUFFER_PENDING)
-    {
-        return;
+        buf_pending = false;
     }
 
-    size_t *idx_ = nthaka_multi_format_handler_get_last_deserialized_index(&fmt);
-    size_t idx = idx_ != nullptr ? *idx_ : 0;
-
-    mutex_enter_blocking(&mtx);
+    while (Serial.available() > 0)
     {
+        int c = Serial.read();
+        if (c < 0)
+        {
+            break;
+        }
+        last_byte_millis = millis();
+
+        nthaka_buffer_state_t s = nthaka_buffer_append(&buf, (uint8_t)c, &out);
+        if (s == NTHAKA_BUFFER_REJECTED)
+        {
+            nthaka_buffer_clear(&buf);
+            buf_pending = false;
+            continue;
+        }
+        if (s == NTHAKA_BUFFER_PENDING)
+        {
+            buf_pending = true;
+            continue;
+        }
+
+        // NTHAKA_BUFFER_ACCEPTED
+        size_t *idx_ = nthaka_multi_format_handler_get_last_deserialized_index(&fmt);
+        size_t idx = idx_ != nullptr ? *idx_ : 0;
+
+        pushCommand(makeCommand(out, idx));
         blinkLEDAsync();
-        updateState(out, idx);
-    }
-    mutex_exit(&mtx);
 
-    nthaka_buffer_clear(&buf);
+        nthaka_buffer_clear(&buf);
+        buf_pending = false;
+    }
 }
 
 /*************************************************************************
@@ -305,32 +347,36 @@ static CGamecubeConsole gamecube(PIN_GAMECUBE);
 
 static Servo servo;
 
-static void initGamecube(CGamecubeConsole &console, jiangtun::State &state)
+// core1-only. Holds status/origin and the last sent report; rumble state
+// written back by gamecube.write() is preserved across polls.
+static Gamecube_Data_t gc_data = defaultGamecubeData;
+
+static void initGamecube(CGamecubeConsole &console, Gamecube_Data_t &data)
 {
-    state.gc_data.report.a = 0;
-    state.gc_data.report.b = 0;
-    state.gc_data.report.x = 0;
-    state.gc_data.report.y = 0;
-    state.gc_data.report.start = 0;
-    state.gc_data.report.dleft = 0;
-    state.gc_data.report.dright = 0;
-    state.gc_data.report.ddown = 0;
-    state.gc_data.report.dup = 0;
-    state.gc_data.report.z = 0;
-    state.gc_data.report.r = 0;
-    state.gc_data.report.l = 0;
-    state.gc_data.report.xAxis = 128;
-    state.gc_data.report.yAxis = 128;
-    state.gc_data.report.cxAxis = 128;
-    state.gc_data.report.cyAxis = 128;
-    state.gc_data.report.left = 0;
-    state.gc_data.report.right = 0;
+    data.report.a = 0;
+    data.report.b = 0;
+    data.report.x = 0;
+    data.report.y = 0;
+    data.report.start = 0;
+    data.report.dleft = 0;
+    data.report.dright = 0;
+    data.report.ddown = 0;
+    data.report.dup = 0;
+    data.report.z = 0;
+    data.report.r = 0;
+    data.report.l = 0;
+    data.report.xAxis = 128;
+    data.report.yAxis = 128;
+    data.report.cxAxis = 128;
+    data.report.cyAxis = 128;
+    data.report.left = 0;
+    data.report.right = 0;
 
     // Magic spell to make the controller be recognized by the Gamecube
-    state.gc_data.report.start = 1;
-    console.write(state.gc_data);
-    state.gc_data.report.start = 0;
-    console.write(state.gc_data);
+    data.report.start = 1;
+    console.write(data);
+    data.report.start = 0;
+    console.write(data);
 }
 
 static inline void pressReset()
@@ -344,17 +390,6 @@ static inline int64_t releaseReset(alarm_id_t _0, void *_1)
 {
     servo.write(90);
     pinMode(PIN_RESET, INPUT);
-
-    if (state.gc_reset != NTHAKA_BUTTON_RELEASED)
-    {
-        mutex_enter_blocking(&mtx);
-        {
-            state.gc_reset = NTHAKA_BUTTON_RELEASED;
-            blinkLEDAsync();
-        }
-        mutex_exit(&mtx);
-    }
-
     return 0;
 }
 
@@ -363,11 +398,7 @@ void setup1()
     // Wait `mutex_init(&mtx);`
     delay(10);
 
-    mutex_enter_blocking(&mtx);
-    {
-        initGamecube(gamecube, state);
-    }
-    mutex_exit(&mtx);
+    initGamecube(gamecube, gc_data);
 
     servo.attach(PIN_SERVO, 500, 2400);
     pinMode(PIN_RESET, INPUT);
@@ -376,33 +407,37 @@ void setup1()
 
 void loop1()
 {
-    Gamecube_Data_t gc_data_copy;
-    jiangtun::ResetAction next_action;
+    jiangtun::Command cmd;
+    bool has_cmd = false;
 
     mutex_enter_blocking(&mtx);
+    if (queueCount > 0)
     {
-        // Read the OR-accumulated state (captures any short presses since last read)
-        gc_data_copy = state.gc_data_held;
-        next_action = state.next_action;
-        state.next_action = jiangtun::ResetAction::Nothing;
+        cmd = queue_[queueHead];
+        has_cmd = true;
     }
     mutex_exit(&mtx);
 
-    bool ok = gamecube.write(gc_data_copy);
+    if (has_cmd)
+    {
+        gc_data.report = cmd.report;
+    }
+
+    bool ok = gamecube.write(gc_data);
+
+    // Advance the queue only after the report actually reached the console;
+    // on failure the same command is retried on the next poll.
+    if (!ok || !has_cmd)
+    {
+        return;
+    }
 
     mutex_enter_blocking(&mtx);
-    {
-        if (ok)
-        {
-            // Reset held state only on successful write;
-            // on failure the accumulated presses are retained for retry.
-            state.gc_data_held = state.gc_data;
-        }
-        state.gc_data.status.rumble = gc_data_copy.status.rumble;
-    }
+    queueHead = (queueHead + 1) % kQueueSize;
+    queueCount--;
     mutex_exit(&mtx);
 
-    switch (next_action)
+    switch (cmd.action)
     {
     case jiangtun::ResetAction::Press:
         pressReset();
